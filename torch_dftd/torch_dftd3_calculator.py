@@ -9,6 +9,7 @@ from torch_dftd.dftd3_xc_params import get_dftd3_default_params
 from torch_dftd.functions.edge_extraction import calc_edge_index
 from torch_dftd.nn.dftd2_module import DFTD2Module
 from torch_dftd.nn.dftd3_module import DFTD3Module
+from torch_dftd.nn.dftd3_keops_module import KeopsDFTD3Module
 
 
 class TorchDFTD3Calculator(Calculator):
@@ -49,6 +50,9 @@ class TorchDFTD3Calculator(Calculator):
         dtype: torch.dtype = torch.float32,
         bidirectional: bool = True,
         cutoff_smoothing: str = "none",
+        return_c6: bool = False,
+        use_keops_d3: bool = False,
+        trainable: bool = False,
         **kwargs,
     ):
         self.dft = dft
@@ -65,6 +69,10 @@ class TorchDFTD3Calculator(Calculator):
                 bidirectional=bidirectional,
                 cutoff_smoothing=cutoff_smoothing,
             )
+        elif use_keops_d3:
+            self.dftd_module = KeopsDFTD3Module(
+                self.params, trainable, dtype=dtype, device=self.device
+            )
         else:
             self.dftd_module = DFTD3Module(
                 self.params,
@@ -78,6 +86,7 @@ class TorchDFTD3Calculator(Calculator):
         self.dftd_module.to(device)
         self.dtype = dtype
         self.cutoff = cutoff
+        self.use_keops_d3 = use_keops_d3
         self.bidirectional = bidirectional
         super(TorchDFTD3Calculator, self).__init__(atoms=atoms, **kwargs)
 
@@ -93,14 +102,14 @@ class TorchDFTD3Calculator(Calculator):
 
     def _preprocess_atoms(self, atoms: Atoms) -> Dict[str, Optional[Tensor]]:
         pos = torch.tensor(atoms.get_positions(), device=self.device, dtype=self.dtype)
-        Z = torch.tensor(atoms.get_atomic_numbers(), device=self.device)
+        Z = torch.tensor(atoms.get_atomic_numbers(), device=self.device, dtype=torch.int64)
         if any(atoms.pbc):
             cell: Optional[Tensor] = torch.tensor(
                 atoms.get_cell(), device=self.device, dtype=self.dtype
             )
         else:
             cell = None
-        pbc = torch.tensor(atoms.pbc, device=self.device)
+        pbc = torch.tensor(atoms.pbc, device=self.device, dtype=torch.bool)
         edge_index, S = self._calc_edge_index(pos, cell, pbc)
         if cell is None:
             shift_pos = S
@@ -116,13 +125,26 @@ class TorchDFTD3Calculator(Calculator):
         input_dicts = self._preprocess_atoms(atoms)
 
         if "forces" in properties or "stress" in properties:
-            results = self.dftd_module.calc_energy_and_forces(**input_dicts, damping=self.damping)[
-                0
-            ]
+            if self.use_keops_d3:
+                results = self.dftd_module.calc_energy_and_forces(
+                    atoms.get_atomic_numbers(), atoms.get_positions()
+                )
+            else:
+                results = self.dftd_module.calc_energy_and_forces(
+                    **input_dicts, damping=self.damping
+                )[0]
         else:
-            results = self.dftd_module.calc_energy(**input_dicts, damping=self.damping)[0]
+            if self.use_keops_d3:
+                results = self.dftd_module.calc_energy(
+                    atoms.get_atomic_numbers(),
+                    torch.tensor(atoms.get_positions(), dtype=self.dtype, device=self.device),
+                )
+            else:
+                results = self.dftd_module.calc_energy(**input_dicts, damping=self.damping)[0]
         self.results["energy"] = results["energy"]
         self.results["free_energy"] = self.results["energy"]
+        if self.return_c6:
+            atoms.arrays["atC6"] = self.results["atC6"]
 
         # Referenced DFTD3 impl.
         if self.dft is not None:
@@ -136,6 +158,8 @@ class TorchDFTD3Calculator(Calculator):
             self.results["forces"] = results["forces"]
         if "stress" in results:
             self.results["stress"] = results["stress"]
+        if "atC6" in results:
+            self.results["atC6"] = results["atC6"]
 
     def get_property(self, name, atoms=None, allow_calculation=True):
         dft_result = None
